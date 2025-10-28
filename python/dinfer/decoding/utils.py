@@ -74,7 +74,8 @@ class TokenArray:
     """
     def __init__(self, prompt, gen_length, mask_id, eos_id, device):
         self.prompt = prompt
-        self.data = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(device)
+        self.batch_size = prompt.shape[0]
+        self.data = torch.full((self.batch_size, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(device)
         self.data[:, :prompt.shape[1]] = prompt.clone()
         self.gen_length = gen_length
         self.eos_id = eos_id
@@ -91,7 +92,19 @@ class TokenArray:
         pass
 
     def get_generated_tokens(self):
-        return self.data[self.data != self.eos_id].unsqueeze(0)
+        # Handle batch processing - return tokens for each batch item
+        results = []
+        for i in range(self.batch_size):
+            # Find EOS position for each batch item
+            eos_positions = (self.data[i] == self.eos_id).nonzero(as_tuple=True)[0]
+            if len(eos_positions) > 0:
+                first_eos = eos_positions[0].item()
+                # Return tokens up to first EOS (including prompt)
+                results.append(self.data[i, :first_eos].unsqueeze(0))
+            else:
+                # No EOS found, return all tokens
+                results.append(self.data[i].unsqueeze(0))
+        return torch.cat(results, dim=0)
 
     def __getitem__(self, idx):
         return self.data[:, idx]
@@ -122,10 +135,11 @@ class DistAlignedTokenArray:
         The number of processes.
     """
     def __init__(self, prompt, gen_length, mask_id, eos_id, device, rank, world_size):
+        self.batch_size = prompt.shape[0]
         total_length = prompt.shape[1] + gen_length
         if total_length % world_size != 0:
             total_length = (total_length // world_size + 1) * world_size
-        self.data = torch.full((prompt.shape[0], total_length), mask_id, dtype=torch.long).to(device)
+        self.data = torch.full((self.batch_size, total_length), mask_id, dtype=torch.long).to(device)
         self.data[:, :prompt.shape[1]] = prompt.clone()
         self.orig_gen_length = gen_length
         self.gen_length = total_length - prompt.shape[1]
@@ -141,7 +155,19 @@ class DistAlignedTokenArray:
         return self.data.device
 
     def get_generated_tokens(self):
-        return self.data[self.data != self.eos_id].unsqueeze(0)
+        # Handle batch processing - return tokens for each batch item
+        results = []
+        for i in range(self.batch_size):
+            # Find EOS position for each batch item
+            eos_positions = (self.data[i] == self.eos_id).nonzero(as_tuple=True)[0]
+            if len(eos_positions) > 0:
+                first_eos = eos_positions[0].item()
+                # Return tokens up to first EOS (including prompt)
+                results.append(self.data[i, :first_eos].unsqueeze(0))
+            else:
+                # No EOS found, return all tokens
+                results.append(self.data[i].unsqueeze(0))
+        return torch.cat(results, dim=0)
 
     def expand(self, new_len):
         pass

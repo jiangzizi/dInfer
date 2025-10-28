@@ -31,28 +31,52 @@ def get_bucket_length(length):
         used_buckets.append(bucket_length)
     return bucket_length
 
-def load_inputs(dataset, tokenizer):
-    with open(dataset, 'r') as f:
-        data = json.load(f)
-    prompts = []
-    questions = []
-    ids = []
-    all_input_ids = []
-    if "judge_details" in data.keys():
-        details_data = data['judge_details']
-    else:
-        details_data = data['details']
-    for id, judge_detail in enumerate(details_data):
-        ids.append(id)
-        prompt = judge_detail['prompt']
-        prompts.append(prompt)
-        questions.append(prompt)
-        prompt = '<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>'+prompt+'<|role_end|><role>ASSISTANT</role>'   
+def load_inputs(dataset: str, tokenizer):
+    prompts, questions, ids, all_input_ids, raw_items = [], [], [], [], []
 
-        input_ids = tokenizer(prompt)['input_ids']
-        input_ids = torch.tensor(input_ids).unsqueeze(0)
-        all_input_ids.append(input_ids)
-    return all_input_ids, prompts, questions, ids
+    if "ifeval" in dataset.lower():
+        with open(dataset, 'r') as f:
+            data = json.load(f)
+        details_data = data.get('judge_details', data.get('details', []))
+        for id, judge_detail in enumerate(details_data):
+            raw_item = judge_detail  # ← 保存原始条目
+            prompt = raw_item['prompt']
+            messages = [{"role": "user", "content": prompt}]
+            try:
+                tokenized = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
+            except TypeError:
+                tokenized = tokenizer.apply_chat_template(messages, return_tensors="pt")
+            input_ids = tokenized.to("cuda")
+
+            ids.append(id)
+            prompts.append(prompt)
+            questions.append(prompt)
+            all_input_ids.append(input_ids)
+            raw_items.append(raw_item)  # ← 保存
+
+    elif "gsm8k" in dataset.lower() or "math-500" in dataset.lower():
+        with open(dataset, 'r') as f:
+            for line in f:
+                raw_item = json.loads(line)  # ← 保存原始行
+                if "gsm8k" in dataset.lower():
+                    prompt = raw_item["prompt"][0]["content"]
+                elif "math-500" in dataset.lower():
+                    prompt = raw_item["problem"] + "\nLet's think step by step and put your answer inside \\boxed{{}}.\n"
+                messages = [{"role": "user", "content": prompt}]
+                try:
+                    tokenized = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
+                except TypeError:
+                    tokenized = tokenizer.apply_chat_template(messages, return_tensors="pt")
+                input_ids = tokenized.to("cuda")
+
+                ids.append(len(raw_items))  # id = index
+                prompts.append(prompt)
+                questions.append(prompt)
+                all_input_ids.append(input_ids)
+                raw_items.append(raw_item)  # ← 保存
+
+    return all_input_ids, prompts, questions, ids, raw_items  # ← 新增返回
+
 
 def cal_bucket_len(args, all_input_ids):
     max_prompt_length = 0
@@ -85,7 +109,7 @@ def main(world_size, rank, gpu_id, args):
     device = torch.device(gpu_id)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    all_input_ids, prompts, questions, ids = load_inputs(args.dataset, tokenizer)
+    all_input_ids, prompts, questions, ids, raw_items = load_inputs(args.dataset, tokenizer)
 
     num_parallel = args.num_parallel
     gen_len = args.gen_len
@@ -118,6 +142,7 @@ def main(world_size, rank, gpu_id, args):
         total_forward = 0
         if rank==0:
             iterator = tqdm.trange(len(all_input_ids))
+            filename = args.output_dir+'/'+'_'.join([str(item) for item in [args.exp_name, dataset_name, args.config, args.parallel_decoding, args.threshold, args.prefix_look]])+'.jsonl'
         else:
             iterator = range(len(all_input_ids))
         start = time.time()
@@ -126,6 +151,7 @@ def main(world_size, rank, gpu_id, args):
         fpss = []
         total_token = 0
         token_numbers = []
+        gen_lens = []
         for i in iterator:   
             input_ids = all_input_ids[i]
             inner_start = time.time()
@@ -135,7 +161,6 @@ def main(world_size, rank, gpu_id, args):
                     parallel_decoding=args.parallel_decoding)
             inner_stop = time.time()
             sample_time = inner_stop - inner_start
-            outputs.append(out)
             total_forward += nfe
             token_number = torch.logical_and(out[0, input_ids.shape[1]:]!=156892, out[0, input_ids.shape[1]:]!=156895).sum().cpu().item()
             token_numbers.append(token_number)
@@ -146,7 +171,26 @@ def main(world_size, rank, gpu_id, args):
             tpss.append(tps)
             fpss.append(fps)
             total_token += token_number
-            if rank==0:
+            gen_len_sample = len(out[0]) - input_ids.shape[1]
+            gen_lens.append(gen_len_sample)
+            if rank == 0:
+                answer = tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True)
+                llm_answer = answer
+
+                # ✅ 基于原始条目构建输出
+                output_item = raw_items[i].copy()  # 保留所有原始字段
+                output_item['llm_answer'] = llm_answer  # 只新增一个字段
+
+                # 可选：如果你也想保留生成指标（如 tps, tpf 等），可以加进去
+                output_item.update({
+                    'generated_length': token_number,
+                    'tpf': tpf,
+                    'tps': tps,
+                    'fps': fps,
+                })
+                with open(filename, 'a') as f:
+                    json.dump(output_item, f)
+                    f.write('\n')
                 print(f"sample {i}, time: {sample_time}, generated: {token_number}, tpf: {tpf}, tps: {tps}, fps: {fps}")
                 print(f'Forward: {total_forward}, Time: {time.time()-start}, FPS: {total_forward/(time.time()-start)}({np.mean(fpss)}), TPS: {total_token/(time.time()-start)}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
 
@@ -154,21 +198,7 @@ def main(world_size, rank, gpu_id, args):
 
         stop = time.time()
         if rank==0:
-            answers = []
-            for i in tqdm.trange(len(outputs)):
-                out = outputs[i]
-                answer = (tokenizer.decode(out[0, all_input_ids[i].shape[1]:], skip_special_tokens=True))
-                answers.append(answer)
             print(f'Forward: {total_forward}, Time: {stop-start}, FPS: {total_forward/(stop-start)}({np.mean(fpss)}), TPS: {total_token/(stop-start)}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
-            filename = args.output_dir+'/'+'_'.join([str(item) for item in [args.exp_name, dataset_name, args.config, args.parallel_decoding, args.threshold, args.prefix_look]])+'.jsonl'
-            with open (filename, 'w') as f:
-                for i in range(len(answers)):
-                    question = questions[i]
-                    prompt = prompts[i]
-                    answer = answers[i]
-                    id = ids[i]
-                    json.dump({'id':id, 'question':question, 'prompt':prompt, 'answer': answer, 'generated_length': token_numbers[i], 'tpf':tpfs[i], 'tps':tpss[i], 'fps':fpss[i], }, f, indent=4)
-                    f.write('\n')
             with open('results.txt', 'a+') as f:
                 print(args.exp_name, args.config, args.parallel_decoding, args.threshold, args.prefix_look, total_forward, stop-start, total_token / len(all_input_ids), total_forward/(stop-start), total_token/(stop-start), total_token/total_forward, sum(gen_lens)/total_forward, np.mean(fpss), np.mean(tpss), np.mean(tpfs), args.dataset, file=f) # dist.destroy_process_group()
 
@@ -179,8 +209,8 @@ import argparse
 if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default='/mnt/dllm/fengling/moe/workdir/7bA1b_anneal_15t_0827_500B_further_8k_enneal_train_4k_ep3_v7_1e-5/step45567_converted_hf_fusemoe')
-    parser.add_argument('--dataset', type=str, default='/mnt/dllm/myx/dumped_prompts/IFEval.json')
+    parser.add_argument('--model_name', type=str, default='/data/public_checkpoints/LLaDa-MoE-7B-A1B-Instruct-fused')
+    parser.add_argument('--dataset', type=str, default='/data/jiangdazhi/dataset/gsm8k/test.jsonl')
     #parser.add_argument('--dataset', type=str, default='/mnt/dllm/wln/test_prev_tokenized_prompt/humaneval_gen_0shot_20250709')
     parser.add_argument('--gpu', type=str, default='0,1,2,3')
     parser.add_argument('--batch_size', type=int, default=1)
@@ -197,7 +227,7 @@ if __name__ == '__main__':
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--dual_cache', action='store_true')
     parser.add_argument('--use_tp', action='store_true')
-    parser.add_argument('--output_dir', type=str, default='/ossfs/workspace/detailed_results_0917')
+    parser.add_argument('--output_dir', type=str, default='/data/jiangdazhi/code/research/dInfer/results')
     parser.add_argument('--config', type=int, default=7)
     args = parser.parse_args()
     procs = []

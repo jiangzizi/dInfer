@@ -211,7 +211,7 @@ import argparse
 if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default='')
+    parser.add_argument('--model_name', type=str, default='/data/public_checkpoints/LLaDA-8B-Instruct')
     parser.add_argument('--dataset', type=str, default='')
     parser.add_argument('--gpu', type=str, default='0,1,2,3')
     parser.add_argument('--batch_size', type=int, default=1)
