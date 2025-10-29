@@ -210,7 +210,7 @@ if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='/data/public_checkpoints/LLaDa-MoE-7B-A1B-Instruct-fused')
-    parser.add_argument('--dataset', type=str, default='/data/jiangdazhi/dataset/gsm8k/test.jsonl')
+    parser.add_argument('--dataset', type=str, default='/data/jiangdazhi/code/research/dInfer/benchmarks/IFEval.json')
     #parser.add_argument('--dataset', type=str, default='/mnt/dllm/wln/test_prev_tokenized_prompt/humaneval_gen_0shot_20250709')
     parser.add_argument('--gpu', type=str, default='0,1,2,3')
     parser.add_argument('--batch_size', type=int, default=1)

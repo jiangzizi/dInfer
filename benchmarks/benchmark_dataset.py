@@ -33,28 +33,52 @@ def get_bucket_length(length):
         used_buckets.append(bucket_length)
     return bucket_length
 
-def load_inputs(dataset, tokenizer):
-    with open(dataset, 'r') as f:
-        data = json.load(f)
-    prompts = []
-    questions = []
-    ids = []
-    all_input_ids = []
-    if "judge_details" in data.keys():
-        details_data = data['judge_details']
-    else:
-        details_data = data['details']
-    for id, judge_detail in enumerate(details_data):
-        ids.append(id)
-        prompt = judge_detail['prompt']
-        prompts.append(prompt)
-        questions.append(prompt)
-        prompt = '<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>'+prompt+'<|role_end|><role>ASSISTANT</role>'   
+def load_inputs(dataset: str, tokenizer):
+    prompts, questions, ids, all_input_ids, raw_items = [], [], [], [], []
 
-        input_ids = tokenizer(prompt)['input_ids']
-        input_ids = torch.tensor(input_ids).unsqueeze(0)
-        all_input_ids.append(input_ids)
+    if "ifeval" in dataset.lower():
+        with open(dataset, 'r') as f:
+            data = json.load(f)
+        details_data = data.get('judge_details', data.get('details', []))
+        for id, judge_detail in enumerate(details_data):
+            raw_item = judge_detail  # ← 保存原始条目
+            prompt = raw_item['prompt']
+            messages = [{"role": "user", "content": prompt}]
+            try:
+                tokenized = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
+            except TypeError:
+                tokenized = tokenizer.apply_chat_template(messages, return_tensors="pt")
+            input_ids = tokenized.to("cuda")
+
+            ids.append(id)
+            prompts.append(prompt)
+            questions.append(prompt)
+            all_input_ids.append(input_ids)
+            raw_items.append(raw_item)  # ← 保存
+
+    elif "gsm8k" in dataset.lower() or "math-500" in dataset.lower():
+        with open(dataset, 'r') as f:
+            for line in f:
+                raw_item = json.loads(line)  # ← 保存原始行
+                if "gsm8k" in dataset.lower():
+                    prompt = raw_item["prompt"][0]["content"]
+                elif "math-500" in dataset.lower():
+                    prompt = raw_item["problem"] + "\nLet's think step by step and put your answer inside \\boxed{{}}.\n"
+                messages = [{"role": "user", "content": prompt}]
+                try:
+                    tokenized = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
+                except TypeError:
+                    tokenized = tokenizer.apply_chat_template(messages, return_tensors="pt")
+                input_ids = tokenized.to("cuda")
+
+                ids.append(len(raw_items))  # id = index
+                prompts.append(prompt)
+                questions.append(prompt)
+                all_input_ids.append(input_ids)
+                raw_items.append(raw_item)  # ← 保存
+
     return all_input_ids, prompts, questions, ids
+
 
 def cal_bucket_len(args, all_input_ids):
     max_prompt_length = 0
@@ -151,6 +175,7 @@ def main(world_size, rank, gpu_id, args):
             total_forward = 0
             if rank==0:
                 iterator = tqdm.trange(len(all_input_ids))
+                filename = args.output_dir+'/'+'_'.join([str(item) for item in [args.exp_name, dataset_name, args.config, args.parallel_decoding, args.threshold, args.prefix_look]])+'.jsonl'
             else:
                 iterator = range(len(all_input_ids))
             start = time.time()
@@ -159,7 +184,7 @@ def main(world_size, rank, gpu_id, args):
             fpss = []
             total_token = 0
             token_numbers = []
-            for i in iterator:   
+            for i in iterator:
                 input_ids = all_input_ids[i].to(device)
                 padded_gen_len = padded_gen_lens[i]
                 inner_start = time.time()
@@ -176,7 +201,16 @@ def main(world_size, rank, gpu_id, args):
                 tps = token_number/sample_time
                 fps = nfe/sample_time
                 if rank == 0:
-                    print(f'iter={i}, fps={fps}, nfe={nfe}')
+                    current_mean_tps = np.mean(tpss) if tpss else 0
+                    print(f'iter={i}, fps={fps}, nfe={nfe}, tps={tps}, current mean tps={current_mean_tps}')
+                    # 立即写入生成的数据
+                    answer = tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True)
+                    question = questions[i]
+                    prompt = prompts[i]
+                    id = ids[i]
+                    with open(filename, 'a') as f:
+                        json.dump({'id':id, 'question':question, 'prompt':prompt, 'answer': answer, 'generated_length': token_number, 'tpf':tpf, 'tps':tps, 'fps':fps, }, f)
+                        f.write('\n')
                 tpfs.append(tpf)
                 tpss.append(tps)
                 fpss.append(fps)
@@ -186,21 +220,7 @@ def main(world_size, rank, gpu_id, args):
 
             stop = time.time()
         if rank==0:
-            answers = []
-            for i in tqdm.trange(len(outputs)):
-                out = outputs[i]
-                answer = (tokenizer.decode(out[0, all_input_ids[i].shape[1]:], skip_special_tokens=True))
-                answers.append(answer)
             print(f'Forward: {total_forward}, Time: {stop-start}, FPS: {total_forward/(stop-start)}({np.mean(fpss)}), TPS: {total_token/(stop-start)}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
-            filename = args.output_dir+'/'+'_'.join([str(item) for item in [args.exp_name, dataset_name, args.config, args.parallel_decoding, args.threshold, args.prefix_look]])+'.jsonl'
-            with open (filename, 'w') as f:
-                for i in range(len(answers)):
-                    question = questions[i]
-                    prompt = prompts[i]
-                    answer = answers[i]
-                    id = ids[i]
-                    json.dump({'id':id, 'question':question, 'prompt':prompt, 'answer': answer, 'generated_length': token_numbers[i], 'tpf':tpfs[i], 'tps':tpss[i], 'fps':fpss[i], }, f, indent=4)
-                    f.write('\n')
             with open('results.txt', 'a+') as f:
                 print(args.exp_name, args.config, args.parallel_decoding, args.threshold, args.prefix_look, total_forward, stop-start, total_token / len(all_input_ids), total_forward/(stop-start), total_token/(stop-start), total_token/total_forward, sum(padded_gen_lens)/total_forward, np.mean(fpss), np.mean(tpss), np.mean(tpfs), args.dataset, file=f)
 
@@ -211,8 +231,8 @@ import argparse
 if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default='/data/public_checkpoints/LLaDA-8B-Instruct')
-    parser.add_argument('--dataset', type=str, default='')
+    parser.add_argument('--model_name', type=str, default='/data/public_checkpoints/LLaDa-MoE-7B-A1B-Instruct-fused')
+    parser.add_argument('--dataset', type=str, default='/data/jiangdazhi/dataset/gsm8k/gsm8k.jsonl')
     parser.add_argument('--gpu', type=str, default='0,1,2,3')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--gen_len', type=int, default=1024)
@@ -228,7 +248,7 @@ if __name__ == '__main__':
     parser.add_argument('--exp_name', type=str, default='exp')
     parser.add_argument('--cache', type=str, default='')
     parser.add_argument('--use_tp', action='store_true')
-    parser.add_argument('--output_dir', type=str, default='/ossfs/workspace/detailed_results_0917')
+    parser.add_argument('--output_dir', type=str, default='/data/jiangdazhi/code/research/dInfer/results')
     parser.add_argument('--config', type=int, default=0)
     args = parser.parse_args()
 
